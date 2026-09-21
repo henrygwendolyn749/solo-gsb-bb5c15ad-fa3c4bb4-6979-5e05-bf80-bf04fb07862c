@@ -8,6 +8,8 @@
 
 此外支持对已完成且可行的任务**定向改卷**（`POST /api/tasks/{task_id}/revise`）：按卷指定必须保留/移除的题号，联合重求解全部卷并在满足原约束的前提下**最大化各卷保留原题总数**，详见下文[定向改卷](#定向改卷post-apitaskstask_idrevise)。
 
+还提供**可版本化的组卷模板**（`POST /api/templates`）：把总分、题型数量、知识点覆盖、难度范围、互斥题组及多卷/候选参数等**题库无关**的约束配置保存为模板，创建后不可原地修改、按版本递增；实例化时（`POST /api/templates/{id}/tasks`）传入新的题库快照与 seed，并可通过白名单 `overrides` 微调约束，实际生效配置与 `template_id`/`version` 一并冻结进任务记录，详见下文[组卷模板](#组卷模板可版本化)。
+
 技术栈：Python · FastAPI · SQLite · OR-Tools CP-SAT · Docker / Compose。
 
 ## 启动
@@ -16,13 +18,22 @@
 docker compose up --build
 ```
 
-容器启动时自动安装依赖并创建 SQLite 数据库，无需任何手动初始化。
+容器启动时自动安装依赖并创建 SQLite 数据库（含 `tasks` 与 `templates` 两张表），无需任何手动初始化。
 
 - API 地址：http://localhost:8000
 - 端口：`8000`（宿主机 `8000` → 容器 `8000`，可在 `docker-compose.yml` 的 `ports` 修改）
 - 必要配置（环境变量，均有默认值，一般无需修改）：
   - `EXAM_DB_PATH`：SQLite 数据库文件路径，默认 `/data/exam.db`（已挂载为持久卷 `exam_data`）
 - 交互式文档（Swagger）：http://localhost:8000/docs
+
+### 本地开发（不用 Docker）
+
+```bash
+pip install -r requirements.txt
+EXAM_DB_PATH=./data/exam.db uvicorn app.main:app --reload --port 8000
+```
+
+数据库表在应用启动（lifespan）时自动创建；`EXAM_DB_PATH` 缺省为 `/data/exam.db`，本地运行时建议按上例指向可写目录。
 
 ## 接口
 
@@ -31,6 +42,9 @@ docker compose up --build
 | `POST` | `/api/tasks` | 创建组卷任务（异步），返回 `task_id` |
 | `POST` | `/api/tasks/{task_id}/revise` | 在已完成且可行的任务上创建**定向改卷**任务（异步） |
 | `GET`  | `/api/tasks/{task_id}` | 查询任务状态与结果 |
+| `POST` | `/api/templates` | 创建组卷模板（不可变、按版本递增） |
+| `GET`  | `/api/templates/{template_id}` | 查询模板（缺省最新版本，`?version=N` 指定历史版本） |
+| `POST` | `/api/templates/{template_id}/tasks` | 用模板实例化组卷任务（异步，新题库快照 + 可选白名单 overrides） |
 | `GET`  | `/health` | 健康检查 |
 
 任务状态：`pending` → `running` → `done`；结果在 `result` 字段中返回（`feasible` / `infeasible` / `error`）。
@@ -361,6 +375,104 @@ curl -X POST http://localhost:8000/api/tasks/42/revise \
      "detail": {"papers": [0, 1], "max_shared_questions": 0}}
   ]
 }
+```
+
+## 组卷模板（可版本化）
+
+模板把一次组卷请求中**与题库无关的约束配置**固化下来：`total_score`、`type_counts`、`knowledge_coverage`、`difficulty_range`、`target_difficulty`、`mutex_groups` 以及多卷/候选参数（`paper_count`、`max_shared_questions`、`alternative_count`、`min_question_changes`）。模板**不含**题库快照、`seed` 与任务名——这些在实例化时提供。
+
+- **不可变、按版本递增**：模板创建后不可原地修改。`POST /api/templates` 缺省创建全新模板（`version=1`）；请求体带上已有 `template_id` 则在其下生成递增的新版本，历史版本保持可查询、可实例化。模板不存在时返回 `404`；约束配置非法或含未知字段返回 `422`。
+- **实例化冻结**：`POST /api/templates/{id}/tasks` 把模板约束与 `overrides` 合并、连同新的 `questions` 快照和 `seed` 做与 `POST /api/tasks` 完全相同的校验，随后将**实际生效配置**（合并结果，含缺省值补全）与 `template_id`/`template_version` 一并冻结进任务记录；求解、择优、冲突集与多卷/多候选行为与普通任务完全一致，且模板任务同样支持[定向改卷](#定向改卷post-apitaskstask_idrevise)（改卷任务沿用同一模板溯源信息）。
+- **白名单 overrides**：`overrides` 只允许覆盖上述模板约束字段；出现未知字段（含 `questions`/`seed`/`name` 等实例化参数）、`null` 值，或合并后配置非法（如单卷下设置 `max_shared_questions`、难度区间倒置、互斥组引用题库中不存在的题号），均返回 `422` 且不创建任务。
+
+### 创建模板（`POST /api/templates`）
+
+```bash
+curl -X POST http://localhost:8000/api/templates \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "高三数学月考模板",
+    "total_score": 150,
+    "type_counts": {"single_choice": 8, "fill_blank": 4, "essay": 4},
+    "knowledge_coverage": {"函数": 2, "导数": 1},
+    "difficulty_range": [0.45, 0.6],
+    "target_difficulty": 0.52,
+    "mutex_groups": [[12, 13]],
+    "paper_count": 2,
+    "max_shared_questions": 1
+  }'
+# -> {"template_id": 1, "version": 1, "latest_version": 1,
+#     "name": "高三数学月考模板", "created_at": "...", "config": {...}}
+```
+
+在同一 `template_id` 下创建新版本（旧版本不受影响）：
+
+```bash
+curl -X POST http://localhost:8000/api/templates \
+  -H "Content-Type: application/json" \
+  -d '{"template_id": 1, "name": "高三数学月考模板·提高班",
+       "total_score": 150, "difficulty_range": [0.55, 0.7]}'
+# -> {"template_id": 1, "version": 2, "latest_version": 2, ...}
+```
+
+### 查询模板（`GET /api/templates/{template_id}`）
+
+```bash
+curl http://localhost:8000/api/templates/1            # 最新版本
+curl "http://localhost:8000/api/templates/1?version=1" # 指定历史版本
+```
+
+响应含 `version`、`latest_version`、`name`、`created_at` 与冻结的 `config`；模板或版本不存在返回 `404`。
+
+### 实例化组卷任务（`POST /api/templates/{template_id}/tasks`）
+
+```bash
+curl -X POST http://localhost:8000/api/templates/1/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "高三数学月考·3 月月考",
+    "questions": [ /* ……新的题库快照…… */ ],
+    "seed": 42,
+    "version": 1,
+    "overrides": {"target_difficulty": 0.5, "alternative_count": 3}
+  }'
+# -> {"task_id": 51, "status": "pending"}
+```
+
+字段说明：
+
+- `questions`：本次的题库快照（必填，提交后冻结）；`seed`：随机种子（缺省 42）。
+- `version`：指定实例化所用的模板版本，缺省为该模板**最新版本**。
+- `overrides`：可选，按白名单覆盖模板约束；上例把期望难度改为 `0.5` 并要求 3 个候选卷组。
+- `name`：任务名称，缺省沿用模板名称。
+
+随后用 `GET /api/tasks/51` 查询进度与结果；模板实例化任务（及其改卷任务）的响应顶层会带回 `template_id` 与 `template_version`：
+
+```json
+{
+  "task_id": 51,
+  "status": "done",
+  "seed": 42,
+  "template_id": 1,
+  "template_version": 1,
+  "result": {"status": "feasible", "alternative_count": 3, "...": "..."}
+}
+```
+
+### overrides 校验示例
+
+```bash
+# 未知字段（questions/seed 等实例化参数也不允许出现在 overrides 中）
+curl -X POST http://localhost:8000/api/templates/1/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"questions": [...], "overrides": {"seed": 1}}'
+# -> 422 {"detail": "overrides 包含未知或不允许覆盖的字段: ['seed']；可覆盖字段: [...]"}
+
+# 非法合并：模板为单卷（未设 paper_count），覆盖 max_shared_questions 无意义
+curl -X POST http://localhost:8000/api/templates/1/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"questions": [...], "overrides": {"max_shared_questions": 1}}'
+# -> 422 {"detail": "模板与 overrides 合并后的配置非法: (body): max_shared_questions 仅在 paper_count 为 2~5 时可设置"}
 ```
 
 ## 可行结果

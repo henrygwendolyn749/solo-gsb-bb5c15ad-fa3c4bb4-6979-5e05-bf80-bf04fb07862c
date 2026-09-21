@@ -1,9 +1,9 @@
 """Pydantic models for the intelligent exam-paper composition API."""
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 QuestionId = Union[int, str]
 
@@ -169,6 +169,119 @@ class ReviseTaskIn(BaseModel):
     )
 
 
+# --------------------------------------------------------------------------- #
+# 组卷模板（可版本化，创建后不可原地修改）
+# --------------------------------------------------------------------------- #
+class TemplateConstraints(BaseModel):
+    """模板保存的题库无关约束配置。
+
+    与 ExamTaskIn 的约束字段一一对应，但不包含 questions/seed/name 等
+    实例化时才确定的字段；互斥题组成员的存在性推迟到实例化时校验。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    total_score: int = Field(..., description="试卷总分（精确等于）")
+    type_counts: Dict[str, int] = Field(
+        default_factory=dict, description="各题型的精确数量，如 {'single_choice': 10, 'essay': 3}"
+    )
+    knowledge_coverage: Dict[str, int] = Field(
+        default_factory=dict, description="知识点覆盖要求：知识点 -> 试卷中至少出现的题目数"
+    )
+    difficulty_range: List[float] = Field(
+        ..., min_length=2, max_length=2, description="试卷平均难度的闭区间 [min, max]，取值 [0,1]"
+    )
+    target_difficulty: Optional[float] = Field(
+        None, description="期望平均难度，用于计算难度偏差；缺省时取难度区间中点"
+    )
+    mutex_groups: List[List[QuestionId]] = Field(
+        default_factory=list, description="互斥题组：每组至多选取 1 题（题号存在性在实例化时校验）"
+    )
+    paper_count: Optional[int] = Field(
+        None, ge=1, le=5, description="平行卷份数：2~5 一次生成多份平行卷；缺省（或 1）为单卷"
+    )
+    max_shared_questions: Optional[int] = Field(
+        None, ge=0, description="任意两卷共同题数上限，仅 paper_count>=2 时生效；缺省为 0"
+    )
+    alternative_count: int = Field(1, ge=1, le=5, description="候选卷组数量，缺省 1")
+    min_question_changes: Optional[int] = Field(
+        None, ge=0, description="后续候选与此前每个候选的每张对应卷至少不同的题目数"
+    )
+
+    @field_validator("total_score")
+    @classmethod
+    def _total_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("total_score 必须为正整数")
+        return v
+
+    @model_validator(mode="after")
+    def _validate(self) -> "TemplateConstraints":
+        lo, hi = self.difficulty_range
+        if not (0.0 <= lo <= hi <= 1.0):
+            raise ValueError("difficulty_range 需满足 0 <= min <= max <= 1")
+        if self.target_difficulty is not None and not (0.0 <= self.target_difficulty <= 1.0):
+            raise ValueError("target_difficulty 必须在 [0,1] 内")
+
+        for t, c in self.type_counts.items():
+            if c <= 0:
+                raise ValueError(f"题型 {t} 的数量必须为正整数")
+        for kp, c in self.knowledge_coverage.items():
+            if c <= 0:
+                raise ValueError(f"知识点 {kp} 的覆盖数量必须为正整数")
+
+        # 互斥题组内不可重复；成员是否存在于题库在实例化（拿到 questions 快照）时校验
+        for gi, group in enumerate(self.mutex_groups):
+            if len(group) != len(set(group)):
+                raise ValueError(f"第 {gi} 个互斥题组内存在重复题目编号")
+
+        if self.max_shared_questions is not None and (self.paper_count or 1) < 2:
+            raise ValueError("max_shared_questions 仅在 paper_count 为 2~5 时可设置")
+        return self
+
+
+class TemplateCreateIn(TemplateConstraints):
+    """创建模板请求：约束配置 + 可选名称；带已有 template_id 时生成其新版本。"""
+
+    name: Optional[str] = Field(None, description="模板名称，便于教研组管理")
+    template_id: Optional[int] = Field(
+        None,
+        ge=1,
+        description="传入已有模板 ID 时在其下创建新版本（version 递增）；缺省创建全新模板（version=1）",
+    )
+
+
+class TemplateOut(BaseModel):
+    template_id: int
+    version: int = Field(..., description="本次返回的模板版本")
+    latest_version: int = Field(..., description="该模板当前最新版本号")
+    name: Optional[str] = None
+    created_at: str
+    config: TemplateConstraints = Field(..., description="该版本冻结的题库无关约束配置")
+
+
+class TemplateTaskIn(BaseModel):
+    """模板实例化请求：新的题库快照 + seed + 可选白名单 overrides。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Optional[str] = Field(None, description="任务名称；缺省沿用模板名称")
+    questions: List[QuestionIn] = Field(..., min_length=1, description="题库快照（提交后冻结）")
+    seed: int = Field(42, description="随机种子，保证同请求结果可复现")
+    version: Optional[int] = Field(
+        None, ge=1, description="指定模板版本；缺省使用该模板的最新版本"
+    )
+    overrides: Dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "按白名单覆盖模板约束：仅允许模板约束字段（total_score / type_counts / "
+            "knowledge_coverage / difficulty_range / target_difficulty / mutex_groups / "
+            "paper_count / max_shared_questions / alternative_count / min_question_changes），"
+            "不允许 null；未知字段或合并后非法均返回 422"
+        ),
+    )
+
+
 class QuestionOut(BaseModel):
     id: QuestionId
     score: int
@@ -298,5 +411,11 @@ class TaskStatus(BaseModel):
     created_at: str
     source_task_id: Optional[int] = Field(
         None, description="定向改卷任务的源任务 ID（仅 revise 任务返回）"
+    )
+    template_id: Optional[int] = Field(
+        None, description="实例化所用的模板 ID（仅模板实例化任务及其改卷任务返回）"
+    )
+    template_version: Optional[int] = Field(
+        None, description="实例化所用的模板版本（仅模板实例化任务及其改卷任务返回）"
     )
     result: Optional[TaskResult] = None
