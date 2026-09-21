@@ -8,21 +8,34 @@
 
 此外支持对已完成且可行的任务**定向改卷**（`POST /api/tasks/{task_id}/revise`）：按卷指定必须保留/移除的题号，联合重求解全部卷并在满足原约束的前提下**最大化各卷保留原题总数**，详见下文[定向改卷](#定向改卷post-apitaskstask_idrevise)。
 
+还提供**可版本化的组卷模板**（`POST /api/templates`）：把题库无关的约束配置（总分、题型数量、知识点覆盖、难度区间、互斥题组、多卷/候选参数）保存为**创建后不可修改**的模板；用 `POST /api/templates/{template_id}/tasks` 以新的题库快照实例化组卷任务时，可通过白名单 `overrides` 覆盖部分约束，**实际生效配置与 `template_id`/`version` 一并冻结进任务记录**，详见下文[组卷模板](#组卷模板可版本化)。
+
 技术栈：Python · FastAPI · SQLite · OR-Tools CP-SAT · Docker / Compose。
 
 ## 启动
 
+### Docker Compose（推荐）
+
 ```bash
-docker compose up --build
+docker compose up --build        # 前台运行；加 -d 后台运行
 ```
 
-容器启动时自动安装依赖并创建 SQLite 数据库，无需任何手动初始化。
+容器启动时自动安装依赖并创建 SQLite 数据库（含 tasks 与 templates 表），无需任何手动初始化。
 
 - API 地址：http://localhost:8000
 - 端口：`8000`（宿主机 `8000` → 容器 `8000`，可在 `docker-compose.yml` 的 `ports` 修改）
 - 必要配置（环境变量，均有默认值，一般无需修改）：
-  - `EXAM_DB_PATH`：SQLite 数据库文件路径，默认 `/data/exam.db`（已挂载为持久卷 `exam_data`）
+  - `EXAM_DB_PATH`：SQLite 数据库文件路径，默认 `/data/exam.db`（已挂载为持久卷 `exam_data`，删除卷 `docker compose down -v` 会清空全部任务与模板）
 - 交互式文档（Swagger）：http://localhost:8000/docs
+- 健康检查：`curl http://localhost:8000/health`（Compose 已配置同路径 healthcheck）
+- 查看日志：`docker compose logs -f exam-api`；停止：`docker compose down`
+
+### 本地开发（不用 Docker）
+
+```bash
+pip install -r requirements.txt
+EXAM_DB_PATH=./exam.db uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
 
 ## 接口
 
@@ -31,6 +44,9 @@ docker compose up --build
 | `POST` | `/api/tasks` | 创建组卷任务（异步），返回 `task_id` |
 | `POST` | `/api/tasks/{task_id}/revise` | 在已完成且可行的任务上创建**定向改卷**任务（异步） |
 | `GET`  | `/api/tasks/{task_id}` | 查询任务状态与结果 |
+| `POST` | `/api/templates` | 创建组卷模板（不可变）；带 `base_template_id` 时创建该谱系的新版本 |
+| `GET`  | `/api/templates/{template_id}` | 查询模板的冻结配置与版本信息 |
+| `POST` | `/api/templates/{template_id}/tasks` | 用模板 + 新题库快照实例化组卷任务（异步，支持白名单 `overrides`） |
 | `GET`  | `/health` | 健康检查 |
 
 任务状态：`pending` → `running` → `done`；结果在 `result` 字段中返回（`feasible` / `infeasible` / `error`）。
@@ -362,6 +378,102 @@ curl -X POST http://localhost:8000/api/tasks/42/revise \
   ]
 }
 ```
+
+## 组卷模板（可版本化）
+
+模板把**题库无关的约束配置**固化为可复用的组卷蓝本：`total_score`、`type_counts`、`knowledge_coverage`、`difficulty_range`、`target_difficulty`、`mutex_groups`、`paper_count`、`max_shared_questions`、`alternative_count`、`min_question_changes`（字段语义与 `/api/tasks` 完全一致）。模板**创建后不可修改**——服务不提供任何修改/删除接口；要调整约束，只能基于既有模板**创建新版本**。
+
+- 模板不含 `questions` / `seed` / `name`：题库快照与种子在实例化时提供；互斥题组引用的题号是否存在，也在实例化时按当次题库快照校验。
+- 每个模板属于一个版本谱系（`root_id` 标识）：首版本 `version=1`，携带 `base_template_id` 创建时在该谱系内递增版本号，`base_template_id` 记录直接派生来源。谱系内每个版本都是完整、独立、不可变的配置快照。
+- 实例化时**实际生效配置**（模板配置 ⊕ 白名单 overrides，含缺省值落定）与 `template_id` / `template_version` 一并冻结进任务记录；任务查询会回显这两个字段，求解流程、结果结构与 `/api/tasks` 完全一致，模板任务同样可以继续[定向改卷](#定向改卷post-apitaskstask_idrevise)。
+
+### 创建模板（`POST /api/templates`）
+
+```bash
+curl -X POST http://localhost:8000/api/templates \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "高三数学月考模板",
+    "config": {
+      "total_score": 150,
+      "type_counts": {"single_choice": 8, "fill_blank": 4, "essay": 4},
+      "knowledge_coverage": {"函数": 2, "导数": 1},
+      "difficulty_range": [0.45, 0.6],
+      "target_difficulty": 0.52,
+      "mutex_groups": [[12, 13]],
+      "paper_count": 2,
+      "max_shared_questions": 0
+    }
+  }'
+```
+
+响应（`201`）回显冻结后的完整配置（缺省字段一并落定）：
+
+```json
+{
+  "template_id": 1,
+  "version": 1,
+  "name": "高三数学月考模板",
+  "root_id": 1,
+  "base_template_id": null,
+  "config": {
+    "total_score": 150,
+    "type_counts": {"single_choice": 8, "fill_blank": 4, "essay": 4},
+    "knowledge_coverage": {"函数": 2, "导数": 1},
+    "difficulty_range": [0.45, 0.6],
+    "target_difficulty": 0.52,
+    "mutex_groups": [[12, 13]],
+    "paper_count": 2,
+    "max_shared_questions": 0,
+    "alternative_count": 1,
+    "min_question_changes": null
+  },
+  "created_at": "2026-09-21 12:00:00"
+}
+```
+
+- `config` 校验规则与 `/api/tasks` 的约束字段一致（难度区间有序、数量为正整数、`max_shared_questions` 仅多卷可设等）；**未知字段一律 422**。
+- 创建新版本：同一请求体加 `"base_template_id": 1`，新模板 `version=2`、`root_id=1`、`base_template_id=1`；`base_template_id` 不存在返回 `404`。`config` 必须完整给出（版本间不做字段级合并）。
+- `GET /api/templates/{template_id}` 返回同一结构；不存在返回 `404`。
+
+### 实例化组卷任务（`POST /api/templates/{template_id}/tasks`）
+
+```bash
+curl -X POST http://localhost:8000/api/templates/1/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "高三数学月考·9 月",
+    "questions": [ /* ……本次题库快照…… */ ],
+    "seed": 42,
+    "overrides": {
+      "difficulty_range": [0.4, 0.65],
+      "knowledge_coverage": {"函数": 3, "导数": 1}
+    }
+  }'
+# -> {"task_id": 57, "status": "pending", "template_id": 1, "template_version": 1}
+```
+
+- `questions`（必填）、`seed`、`name` 为实例化请求的独立字段；`name` 缺省沿用模板名称。
+- `overrides` 逐字段覆盖模板配置，**仅允许白名单字段**：`total_score`、`type_counts`、`knowledge_coverage`、`difficulty_range`、`target_difficulty`、`mutex_groups`、`paper_count`、`max_shared_questions`、`alternative_count`、`min_question_changes`；显式置 `null` 表示清除模板值、回到缺省行为（如 `"target_difficulty": null` 恢复为区间中点）。
+- 白名单之外的任何字段（未知字段、拼写错误、`questions`/`seed`/`name` 等）一律 `422`，错误明细列出全部可覆盖字段。
+- 合并后的生效配置连同题库快照按 `/api/tasks` 的同一套规则全量校验，**非法合并**（如把 `paper_count` 覆盖为 `1` 而模板带有 `max_shared_questions`、难度区间倒置、互斥组引用了快照中不存在的题号等）返回 `422` 与逐字段错误明细。
+- 校验通过但约束本身无解时，任务正常创建，结果按既有规则返回 `infeasible` 与最小冲突约束集。
+
+实例化任务的查询与 `/api/tasks` 完全同构，`GET /api/tasks/57` 额外回显模板溯源信息：
+
+```json
+{
+  "task_id": 57,
+  "status": "done",
+  "name": "高三数学月考·9 月",
+  "seed": 42,
+  "template_id": 1,
+  "template_version": 1,
+  "result": {"status": "feasible", "paper_count": 2, "papers": [ /* …… */ ]}
+}
+```
+
+> 直接通过 `POST /api/tasks` 创建的任务不返回 `template_id` / `template_version` 字段，原有行为完全不变。
 
 ## 可行结果
 

@@ -1,19 +1,27 @@
-"""FastAPI application: task creation, revision and result query."""
+"""FastAPI application: templates, task creation, revision and result query."""
 from __future__ import annotations
 
 import json
+import sqlite3
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import asynccontextmanager
+from pydantic import ValidationError
 
 from . import database
 from .schemas import (
+    OVERRIDABLE_FIELDS,
     ExamTaskIn,
     ReviseTaskIn,
     TaskCreated,
     TaskResult,
     TaskStatus,
+    TemplateConfig,
+    TemplateIn,
+    TemplateOut,
+    TemplateTaskCreated,
+    TemplateTaskIn,
 )
 from .worker import submit
 
@@ -28,9 +36,10 @@ app = FastAPI(
     title="智能组卷 API",
     description=(
         "面向教研组的题库快照约束组卷服务（FastAPI + SQLite + OR-Tools CP-SAT），"
-        "支持 2~5 份平行卷联合组卷与 1~5 个差异化候选卷组"
+        "支持 2~5 份平行卷联合组卷、1~5 个差异化候选卷组，"
+        "以及可版本化、创建后不可变的组卷模板"
     ),
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -51,6 +60,119 @@ def create_task(payload: ExamTaskIn) -> TaskCreated:
     )
     submit(task_id)
     return TaskCreated(task_id=task_id, status="pending")
+
+
+# --------------------------------------------------------------------------- #
+# 组卷模板：可版本化、创建后不可变的题库无关约束配置
+# --------------------------------------------------------------------------- #
+def _template_out(row: sqlite3.Row) -> TemplateOut:
+    return TemplateOut(
+        template_id=row["id"],
+        version=row["version"],
+        name=row["name"],
+        root_id=row["root_id"],
+        base_template_id=row["base_id"],
+        config=TemplateConfig(**json.loads(row["config"])),
+        created_at=row["created_at"],
+    )
+
+
+@app.post("/api/templates", response_model=TemplateOut, status_code=201)
+def create_template(payload: TemplateIn) -> TemplateOut:
+    """创建组卷模板（题库无关的约束配置，创建后不可修改）。
+
+    携带 base_template_id 时在该模板的版本谱系上创建新版本（version 递增），
+    否则创建 version=1 的全新模板；模板不提供任何修改/删除接口。
+    """
+    base_row = None
+    if payload.base_template_id is not None:
+        base_row = database.get_template(payload.base_template_id)
+        if base_row is None:
+            raise HTTPException(status_code=404, detail="基准模板不存在")
+    config_json = json.dumps(payload.config.model_dump(), ensure_ascii=False)
+    template_id, _ = database.create_template(payload.name, config_json, base_row)
+    return _template_out(database.get_template(template_id))
+
+
+@app.get("/api/templates/{template_id}", response_model=TemplateOut)
+def get_template(template_id: int) -> TemplateOut:
+    """查询模板的冻结配置与版本信息。"""
+    row = database.get_template(template_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    return _template_out(row)
+
+
+def _validation_detail(exc: ValidationError) -> List[Dict[str, Any]]:
+    """将 Pydantic 校验错误转换为可 JSON 序列化的 422 明细。"""
+    return [
+        {"loc": [str(p) for p in e["loc"]], "msg": e["msg"], "type": e["type"]}
+        for e in exc.errors()
+    ]
+
+
+@app.post(
+    "/api/templates/{template_id}/tasks",
+    response_model=TemplateTaskCreated,
+    status_code=201,
+)
+def create_task_from_template(
+    template_id: int, payload: TemplateTaskIn
+) -> TemplateTaskCreated:
+    """以模板为约束蓝本实例化组卷任务（异步）。
+
+    模板配置与 overrides 逐字段合并（overrides 优先，仅限白名单字段），
+    合并结果连同新的题库快照一起按 ExamTaskIn 全量校验；实际生效配置与
+    template_id/template_version 一并冻结进任务记录，求解流程与 /api/tasks 一致。
+    """
+    row = database.get_template(template_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="模板不存在")
+
+    # 白名单之外的任何字段（未知字段、questions/seed/name 等）一律拒绝
+    unknown = sorted(set(payload.overrides) - OVERRIDABLE_FIELDS)
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"overrides 包含不允许覆盖的字段: {unknown}；"
+                f"可覆盖字段（白名单）: {sorted(OVERRIDABLE_FIELDS)}"
+            ),
+        )
+
+    config = json.loads(row["config"])
+    merged = {**config, **payload.overrides}
+    name = payload.name if payload.name is not None else row["name"]
+    try:
+        effective = ExamTaskIn(
+            name=name,
+            questions=payload.questions,
+            seed=payload.seed,
+            **merged,
+        )
+    except ValidationError as exc:
+        # 非法合并：覆盖值自身非法，或与模板其余约束组合后非法
+        raise HTTPException(
+            status_code=422, detail=_validation_detail(exc)
+        ) from exc
+
+    # 冻结实际生效配置与模板溯源信息；kind=template 仅供识别，求解同普通任务
+    frozen = effective.model_dump()
+    frozen["kind"] = "template"
+    frozen["template_id"] = row["id"]
+    frozen["template_version"] = row["version"]
+    task_id = database.create_task(
+        name,
+        json.dumps(frozen, ensure_ascii=False),
+        payload.seed,
+    )
+    submit(task_id)
+    return TemplateTaskCreated(
+        task_id=task_id,
+        status="pending",
+        template_id=row["id"],
+        template_version=row["version"],
+    )
 
 
 def _source_paper_selection(
@@ -157,6 +279,13 @@ def get_task(task_id: int) -> TaskStatus:
     if req.get("kind") == "revise":
         source_task_id = req.get("source_task_id")
 
+    # 模板实例化任务：回显冻结的模板溯源信息（普通任务不返回这两个字段）
+    template_id: Optional[int] = None
+    template_version: Optional[int] = None
+    if req.get("kind") == "template":
+        template_id = req.get("template_id")
+        template_version = req.get("template_version")
+
     return TaskStatus(
         task_id=row["id"],
         status=row["status"],
@@ -164,5 +293,7 @@ def get_task(task_id: int) -> TaskStatus:
         seed=row["seed"],
         created_at=row["created_at"],
         source_task_id=source_task_id,
+        template_id=template_id,
+        template_version=template_version,
         result=result,
     )

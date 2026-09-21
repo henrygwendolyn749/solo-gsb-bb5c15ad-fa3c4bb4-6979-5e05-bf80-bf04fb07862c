@@ -1,9 +1,9 @@
 """Pydantic models for the intelligent exam-paper composition API."""
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 QuestionId = Union[int, str]
 
@@ -169,6 +169,151 @@ class ReviseTaskIn(BaseModel):
     )
 
 
+# --------------------------------------------------------------------------- #
+# 组卷模板（可版本化、创建后不可变）
+# --------------------------------------------------------------------------- #
+#: 实例化模板任务时允许通过 overrides 覆盖的约束字段（白名单）。
+#: questions / seed / name 是实例化请求的独立字段，不属于可覆盖约束；
+#: 除此之外的任何字段（含拼写错误）一律拒绝。
+OVERRIDABLE_FIELDS = frozenset(
+    {
+        "total_score",
+        "type_counts",
+        "knowledge_coverage",
+        "difficulty_range",
+        "target_difficulty",
+        "mutex_groups",
+        "paper_count",
+        "max_shared_questions",
+        "alternative_count",
+        "min_question_changes",
+    }
+)
+
+
+class TemplateConfig(BaseModel):
+    """模板冻结的题库无关约束配置（创建后不可修改）。
+
+    字段与 ExamTaskIn 的约束字段一一对应，但不包含 questions/seed/name：
+    题库快照与种子在实例化（POST /api/templates/{id}/tasks）时提供，
+    互斥题组的题号存在性也在实例化时按题库快照校验。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    total_score: int = Field(..., description="试卷总分（精确等于）")
+    type_counts: Dict[str, int] = Field(
+        default_factory=dict, description="各题型的精确数量"
+    )
+    knowledge_coverage: Dict[str, int] = Field(
+        default_factory=dict, description="知识点 -> 试卷中至少出现的题目数"
+    )
+    difficulty_range: List[float] = Field(
+        ..., min_length=2, max_length=2, description="试卷平均难度闭区间 [min, max]，取值 [0,1]"
+    )
+    target_difficulty: Optional[float] = Field(
+        None, description="期望平均难度；缺省取难度区间中点"
+    )
+    mutex_groups: List[List[QuestionId]] = Field(
+        default_factory=list,
+        description="互斥题组：每组至多选取 1 题（题号存在性在实例化时校验）",
+    )
+    paper_count: Optional[int] = Field(
+        None, ge=1, le=5, description="平行卷份数：2~5 为多卷；缺省（或 1）为单卷"
+    )
+    max_shared_questions: Optional[int] = Field(
+        None, ge=0, description="任意两卷共同题数上限，仅 paper_count>=2 时生效"
+    )
+    alternative_count: int = Field(1, ge=1, le=5, description="候选卷组数量，缺省 1")
+    min_question_changes: Optional[int] = Field(
+        None, ge=0, description="后续候选与此前每个候选的每张对应卷至少不同的题目数"
+    )
+
+    @field_validator("total_score")
+    @classmethod
+    def _total_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("total_score 必须为正整数")
+        return v
+
+    @model_validator(mode="after")
+    def _validate(self) -> "TemplateConfig":
+        lo, hi = self.difficulty_range
+        if not (0.0 <= lo <= hi <= 1.0):
+            raise ValueError("difficulty_range 需满足 0 <= min <= max <= 1")
+        if self.target_difficulty is not None and not (0.0 <= self.target_difficulty <= 1.0):
+            raise ValueError("target_difficulty 必须在 [0,1] 内")
+
+        for t, c in self.type_counts.items():
+            if c <= 0:
+                raise ValueError(f"题型 {t} 的数量必须为正整数")
+        for kp, c in self.knowledge_coverage.items():
+            if c <= 0:
+                raise ValueError(f"知识点 {kp} 的覆盖数量必须为正整数")
+
+        # 互斥题组：组内不可重复；题号是否存在于题库在实例化时校验
+        for gi, group in enumerate(self.mutex_groups):
+            if len(group) != len(set(group)):
+                raise ValueError(f"第 {gi} 个互斥题组内存在重复题目编号")
+
+        if self.max_shared_questions is not None and (self.paper_count or 1) < 2:
+            raise ValueError("max_shared_questions 仅在 paper_count 为 2~5 时可设置")
+        return self
+
+
+class TemplateIn(BaseModel):
+    """创建模板请求：完整给出约束配置；基于既有模板时创建其谱系的新版本。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Optional[str] = Field(None, description="模板名称，便于教研组管理")
+    base_template_id: Optional[int] = Field(
+        None,
+        description="既有模板 ID：在其版本谱系上创建新版本（version 递增）；缺省创建全新模板（version=1）",
+    )
+    config: TemplateConfig
+
+
+class TemplateOut(BaseModel):
+    """模板详情：配置为创建时冻结的内容，任何字段都不会随时间变化。"""
+
+    template_id: int
+    version: int = Field(..., description="谱系内版本号，从 1 起单调递增")
+    name: Optional[str] = None
+    root_id: int = Field(..., description="版本谱系根模板 ID（首版本的 template_id）")
+    base_template_id: Optional[int] = Field(
+        None, description="派生来源模板 ID（首版本为 null）"
+    )
+    config: TemplateConfig
+    created_at: str
+
+
+class TemplateTaskIn(BaseModel):
+    """模板实例化请求：新的题库快照 + seed + 白名单约束覆盖。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Optional[str] = Field(None, description="任务名称；缺省沿用模板名称")
+    questions: List[QuestionIn] = Field(..., min_length=1, description="题库快照（提交后冻结）")
+    seed: int = Field(42, description="随机种子，保证同请求结果可复现")
+    overrides: Dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "约束覆盖项：仅允许白名单字段（total_score / type_counts / knowledge_coverage / "
+            "difficulty_range / target_difficulty / mutex_groups / paper_count / "
+            "max_shared_questions / alternative_count / min_question_changes），"
+            "逐字段覆盖模板配置；显式置 null 表示清除模板值回到缺省行为"
+        ),
+    )
+
+
+class TemplateTaskCreated(BaseModel):
+    task_id: int
+    status: str
+    template_id: int
+    template_version: int
+
+
 class QuestionOut(BaseModel):
     id: QuestionId
     score: int
@@ -298,5 +443,11 @@ class TaskStatus(BaseModel):
     created_at: str
     source_task_id: Optional[int] = Field(
         None, description="定向改卷任务的源任务 ID（仅 revise 任务返回）"
+    )
+    template_id: Optional[int] = Field(
+        None, description="实例化来源模板 ID（仅模板实例化任务返回）"
+    )
+    template_version: Optional[int] = Field(
+        None, description="实例化来源模板的版本号（仅模板实例化任务返回）"
     )
     result: Optional[TaskResult] = None
